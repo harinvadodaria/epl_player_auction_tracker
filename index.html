@@ -258,6 +258,21 @@
   .error-banner b{ display:block; margin-bottom:4px; }
 
   .tournament-tabs{ display:flex; gap:8px; margin-bottom:20px; flex-wrap:wrap; }
+
+  .refresh-bar{
+    display:flex; align-items:center; gap:14px; flex-wrap:wrap;
+    background:var(--navy-900); border:1px solid var(--line); border-radius:var(--radius);
+    padding:14px 16px; margin-bottom:20px;
+  }
+  .refresh-bar .btn.is-loading{ opacity:0.75; pointer-events:none; }
+  .refresh-bar-status{ font-size:12.5px; color:var(--ink-muted); }
+
+  .view-toggle{ display:flex; gap:8px; margin-bottom:20px; }
+  .view-tab{
+    background:var(--navy-900); border:1px solid var(--line); color:var(--ink-muted);
+    padding:10px 18px; border-radius:var(--radius-sm); font-size:13.5px; font-weight:700;
+  }
+  .view-tab.active{ background:var(--teal); color:var(--navy-950); border-color:var(--teal); }
   .t-tab{ background:var(--navy-900); border:1px solid var(--line); color:var(--ink-muted); padding:10px 16px; border-radius:var(--radius-sm); font-size:13px; font-weight:600; }
   .t-tab.active{ background:var(--navy-800); color:var(--cream); border-color:var(--magenta); box-shadow:0 0 0 1px var(--magenta) inset; }
 
@@ -399,7 +414,7 @@
     localStorage.setItem(APP_MODE_KEY, mode);
     modeLiveBtn.classList.toggle('active', mode === 'live');
     modeManualBtn.classList.toggle('active', mode === 'manual');
-    if(mode === 'live'){ stopManualView(); renderLiveTopbar(); renderLive(); }
+    if(mode === 'live'){ stopManualView(); renderLiveTopbar(); startLivePolling(); }
     else { stopLivePolling(); renderManualTopbar(); renderManual(); }
   }
   modeLiveBtn.onclick = function(){ setMode('live'); };
@@ -450,12 +465,14 @@
   var live = {
     sources: loadSources(),
     tournament: localStorage.getItem('epl_live_tournament') || 'boys',
+    view: 'pool', // 'pool' | 'team' — pool is the default landing view
     team: null,
     data: {},          // tournamentKey -> parsed data
     lastFetched: {},   // tournamentKey -> Date
     loading: false,
     error: null,
     pollTimer: null,
+    fetchSeq: {},      // tournamentKey -> counter, guards against a slow stale response overwriting a newer one
     poolFilter: 'all',
     poolSearch: ''
   };
@@ -529,7 +546,16 @@
   }
 
   function parseSheetData(csvText){
-    var rows = parseCSV(csvText);
+    return parseSheetDataFromRows(parseCSV(csvText));
+  }
+
+  // Entry point for Google Sheets API v4 values.get responses, which already
+  // return a 2D array (ragged — trailing empty cells per row are omitted).
+  function parseSheetDataFromValues(values){
+    return parseSheetDataFromRows(values || []);
+  }
+
+  function parseSheetDataFromRows(rows){
 
     var config = { totalPurseCr:null, basePriceCr:null, captainPriceCr:null, teams:[], minTeamSize:null, maxPlayers:null };
     var tournamentTitle = (rows[0] && rows[0][0]) ? rows[0][0].trim() : '';
@@ -638,12 +664,15 @@
     var src = live.sources[key];
     if(!src || !src.url){ live.error = 'No sheet source configured yet — add a published CSV link via the gear icon.'; renderLive(); return Promise.reject(new Error('No sheet configured')); }
     if(showLoadingUI){ live.loading = true; live.error = null; renderLive(); }
-    return fetch(csvUrlFor(src.url), { cache:'no-store' })
+    var mySeq = (live.fetchSeq[key] = (live.fetchSeq[key] || 0) + 1);
+    var bustUrl = csvUrlFor(src.url) + (src.url.indexOf('?') === -1 ? '?' : '&') + '_ts=' + Date.now();
+    return fetch(bustUrl, { cache:'no-store' })
       .then(function(res){
         if(!res.ok) throw new Error('HTTP ' + res.status);
         return res.text();
       })
       .then(function(text){
+        if(live.fetchSeq[key] !== mySeq) return; // a newer request already landed; discard this stale one
         if(text.indexOf('<') === 0 || /accounts\.google\.com/.test(text)){
           throw new Error('Link did not return CSV data');
         }
@@ -658,6 +687,7 @@
         renderLive();
       })
       .catch(function(err){
+        if(live.fetchSeq[key] !== mySeq) return;
         live.loading = false;
         live.error = err.message || 'Failed to load sheet';
         renderLive();
@@ -676,10 +706,8 @@
   function renderLiveTopbar(){
     var html = '';
     html += '<div class="live-status ' + (live.error ? 'error' : (live.loading ? 'loading' : '')) + '" id="liveStatus"><span class="dot"></span><span id="liveStatusText">' + liveStatusText() + '</span></div>';
-    html += '<button class="icon-btn" id="liveRefreshBtn" title="Refresh now">⟳</button>';
     html += '<button class="icon-btn" id="liveSourcesBtn" title="Edit sheet sources">⚙</button>';
     topbarControls.innerHTML = html;
-    document.getElementById('liveRefreshBtn').onclick = function(){ fetchTournament(live.tournament, true); };
     document.getElementById('liveSourcesBtn').onclick = openSourcesModal;
   }
 
@@ -709,6 +737,12 @@
     });
     html += '</div>';
 
+    // Prominent refresh bar — not tucked into a corner icon.
+    html += '<div class="refresh-bar">';
+    html +=   '<button class="btn btn-primary' + (live.loading ? ' is-loading' : '') + '" id="liveRefreshBtnMain">' + (live.loading ? 'Refreshing…' : '⟳ Refresh now') + '</button>';
+    html +=   '<span class="refresh-bar-status">' + esc(liveStatusText()) + '</span>';
+    html += '</div>';
+
     if(live.error){
       html += '<div class="error-banner"><b>Couldn\'t load live data</b>' + esc(live.error) + '. This tournament\'s sheet needs to be published to the web as CSV (File \u2192 Share \u2192 Publish to web \u2192 CSV) \u2014 a regular share link can\'t be fetched from here. Update the link under the gear icon, then hit refresh.</div>';
     }
@@ -725,81 +759,88 @@
     var teamNames = data.config.teams;
     if(!live.team || !teamNames.includes(live.team)) live.team = teamNames[0] || null;
 
-    html += '<div class="team-header">';
-    html +=   '<div><h2>' + esc(data.tournamentTitle || 'Tournament') + '</h2>';
-    html +=   '<div class="cap-line">Purse <b>' + fmtCr(data.config.totalPurseCr) + ' Cr</b> · Captain <b>' + fmtCr(data.config.captainPriceCr) + ' Cr</b> · Base <b>' + fmtCr(data.config.basePriceCr) + ' Cr</b> · Min squad <b>' + (data.config.minTeamSize || '—') + '</b></div></div>';
-    if(teamNames.length){
-      html += '<select class="select-ctl" id="liveTeamSelect">' + teamNames.map(function(t){ return '<option value="' + esc(t) + '"' + (t === live.team ? ' selected' : '') + '>' + esc(t) + '</option>'; }).join('') + '</select>';
-    }
+    // View toggle: Pool (default landing view) vs Team
+    html += '<div class="view-toggle">';
+    html +=   '<button class="view-tab ' + (live.view === 'pool' ? 'active' : '') + '" data-view="pool">Player Pool</button>';
+    html +=   '<button class="view-tab ' + (live.view === 'team' ? 'active' : '') + '" data-view="team">Team View</button>';
     html += '</div>';
 
-    var team = live.team ? data.teams[live.team] : null;
-    if(team){
-      var lowPurse = data.config.totalPurseCr > 0 && team.remainingPurseCr !== null && (team.remainingPurseCr / data.config.totalPurseCr) < 0.1;
-      var slotsFilled = team.members.length;
-      var slotsTarget = data.config.maxPlayers || data.config.minTeamSize;
-      html += '<div class="scoreboard">';
-      html +=   scoreCell('Total Purse', fmtCr(data.config.totalPurseCr) + ' Cr', 'total');
-      html +=   scoreCell('Spent', fmtCr(team.totalSpentCr) + ' Cr', 'spent', slotsFilled + (slotsTarget ? ' / ' + slotsTarget : '') + ' players');
-      html +=   scoreCell('Remaining Purse', fmtCr(team.remainingPurseCr) + ' Cr', 'remaining' + (lowPurse ? ' low' : ''));
-      html +=   scoreCell('Max Bid', fmtCr(team.maxBidCr) + ' Cr', 'maxbid' + (team.maxBidCr !== null && team.maxBidCr <= 0 ? ' zero' : ''), 'from sheet');
+    if(live.view === 'team'){
+      html += '<div class="team-header">';
+      html +=   '<div><h2>' + esc(data.tournamentTitle || 'Tournament') + '</h2>';
+      html +=   '<div class="cap-line">Purse <b>' + fmtCr(data.config.totalPurseCr) + ' Cr</b> · Captain <b>' + fmtCr(data.config.captainPriceCr) + ' Cr</b> · Base <b>' + fmtCr(data.config.basePriceCr) + ' Cr</b> · Min squad <b>' + (data.config.minTeamSize || '—') + '</b></div></div>';
+      if(teamNames.length){
+        html += '<select class="select-ctl" id="liveTeamSelect">' + teamNames.map(function(t){ return '<option value="' + esc(t) + '"' + (t === live.team ? ' selected' : '') + '>' + esc(t) + '</option>'; }).join('') + '</select>';
+      }
       html += '</div>';
 
-      html += '<div class="panel"><h3>Squad Roster<span class="count">' + slotsFilled + (slotsTarget ? ' / ' + slotsTarget : '') + '</span></h3>';
-      html += '<table class="roster-table"><thead><tr><th>#</th><th>Player</th><th>Role</th><th>Round</th><th class="row-actions">Price (Cr)</th></tr></thead><tbody>';
-      if(team.members.length === 0){
-        html += '<tr class="empty-roster-row"><td colspan="5">No players recorded yet.</td></tr>';
+      var team = live.team ? data.teams[live.team] : null;
+      if(team){
+        var lowPurse = data.config.totalPurseCr > 0 && team.remainingPurseCr !== null && (team.remainingPurseCr / data.config.totalPurseCr) < 0.1;
+        var slotsFilled = team.members.length;
+        var slotsTarget = data.config.maxPlayers || data.config.minTeamSize;
+        html += '<div class="scoreboard">';
+        html +=   scoreCell('Total Purse', fmtCr(data.config.totalPurseCr) + ' Cr', 'total');
+        html +=   scoreCell('Spent', fmtCr(team.totalSpentCr) + ' Cr', 'spent', slotsFilled + (slotsTarget ? ' / ' + slotsTarget : '') + ' players');
+        html +=   scoreCell('Remaining Purse', fmtCr(team.remainingPurseCr) + ' Cr', 'remaining' + (lowPurse ? ' low' : ''));
+        html +=   scoreCell('Max Bid', fmtCr(team.maxBidCr) + ' Cr', 'maxbid' + (team.maxBidCr !== null && team.maxBidCr <= 0 ? ' zero' : ''), 'from sheet');
+        html += '</div>';
+
+        html += '<div class="panel"><h3>Squad Roster<span class="count">' + slotsFilled + (slotsTarget ? ' / ' + slotsTarget : '') + '</span></h3>';
+        html += '<table class="roster-table"><thead><tr><th>#</th><th>Player</th><th>Role</th><th class="row-actions">Price (Cr)</th></tr></thead><tbody>';
+        if(team.members.length === 0){
+          html += '<tr class="empty-roster-row"><td colspan="4">No players recorded yet.</td></tr>';
+        } else {
+          team.members.forEach(function(m, idx){
+            html += '<tr>';
+            html +=   '<td class="slot-cell">' + (idx+1) + '</td>';
+            html +=   '<td><div class="player-name">' + esc(m.name) + (m.isCaptain ? '<span class="badge captain">Captain</span>' : '') + '</div></td>';
+            html +=   '<td class="role-cell">' + esc(m.role || '—') + '</td>';
+            html +=   '<td class="row-actions price-cell">₹' + fmtCr(m.priceCr) + '</td>';
+            html += '</tr>';
+          });
+        }
+        html += '</tbody></table></div>';
       } else {
-        team.members.forEach(function(m, idx){
+        html += '<div class="empty-state"><p>No teams configured in this sheet yet.</p></div>';
+      }
+    } else {
+      // Player pool (default view)
+      var pool = data.pool || [];
+      var filtered = pool.filter(function(p){
+        if(live.poolFilter === 'sold' && norm(p.status) !== 'sold') return false;
+        if(live.poolFilter === 'unsold' && norm(p.status) !== 'unsold') return false;
+        if(live.poolSearch && p.name.toLowerCase().indexOf(live.poolSearch.toLowerCase()) === -1) return false;
+        return true;
+      });
+      html += '<div class="panel">';
+      html +=   '<h3>' + esc(data.tournamentTitle || 'Player Pool') + '<span class="count">' + filtered.length + ' / ' + pool.length + '</span></h3>';
+      html +=   '<div class="pool-controls">';
+      html +=     '<input type="text" class="pool-search" id="poolSearchInput" placeholder="Search player…" value="' + esc(live.poolSearch) + '">';
+      html +=     '<div class="chip-group">';
+      html +=       '<button class="chip ' + (live.poolFilter==='all'?'active':'') + '" data-filter="all">All</button>';
+      html +=       '<button class="chip ' + (live.poolFilter==='sold'?'active':'') + '" data-filter="sold">Sold</button>';
+      html +=       '<button class="chip ' + (live.poolFilter==='unsold'?'active':'') + '" data-filter="unsold">Unsold</button>';
+      html +=     '</div>';
+      html +=   '</div>';
+      html +=   '<div class="pool-scroll"><table class="roster-table"><thead><tr><th>Player</th><th>Role</th><th>Status</th><th>Team</th><th class="row-actions">Price (Cr)</th></tr></thead><tbody>';
+      if(filtered.length === 0){
+        html += '<tr class="empty-roster-row"><td colspan="5">No matching players.</td></tr>';
+      } else {
+        filtered.forEach(function(p){
+          var statusCls = norm(p.status) === 'sold' ? 'sold' : 'unsold';
           html += '<tr>';
-          html +=   '<td class="slot-cell">' + (idx+1) + '</td>';
-          html +=   '<td><div class="player-name">' + esc(m.name) + (m.isCaptain ? '<span class="badge captain">Captain</span>' : '') + '</div></td>';
-          html +=   '<td class="role-cell">' + esc(m.role || '—') + '</td>';
-          html +=   '<td class="role-cell">' + esc(m.round || '—') + '</td>';
-          html +=   '<td class="row-actions price-cell">₹' + fmtCr(m.priceCr) + '</td>';
+          html +=   '<td class="player-name">' + esc(p.name) + '</td>';
+          html +=   '<td class="role-cell">' + esc(p.role || '—') + '</td>';
+          html +=   '<td><span class="badge ' + statusCls + '">' + esc(p.status || '—') + '</span></td>';
+          html +=   '<td class="role-cell">' + esc(p.team || '—') + '</td>';
+          html +=   '<td class="row-actions price-cell">' + (p.priceCr !== null ? '₹' + fmtCr(p.priceCr) : '—') + '</td>';
           html += '</tr>';
         });
       }
-      html += '</tbody></table></div>';
-    } else {
-      html += '<div class="empty-state"><p>No teams configured in this sheet yet.</p></div>';
+      html +=   '</tbody></table></div>';
+      html += '</div>';
     }
-
-    // Player pool
-    var pool = data.pool || [];
-    var filtered = pool.filter(function(p){
-      if(live.poolFilter === 'sold' && norm(p.status) !== 'sold') return false;
-      if(live.poolFilter === 'unsold' && norm(p.status) !== 'unsold') return false;
-      if(live.poolSearch && p.name.toLowerCase().indexOf(live.poolSearch.toLowerCase()) === -1) return false;
-      return true;
-    });
-    html += '<div class="panel">';
-    html +=   '<h3>Player Pool<span class="count">' + filtered.length + ' / ' + pool.length + '</span></h3>';
-    html +=   '<div class="pool-controls">';
-    html +=     '<input type="text" class="pool-search" id="poolSearchInput" placeholder="Search player…" value="' + esc(live.poolSearch) + '">';
-    html +=     '<div class="chip-group">';
-    html +=       '<button class="chip ' + (live.poolFilter==='all'?'active':'') + '" data-filter="all">All</button>';
-    html +=       '<button class="chip ' + (live.poolFilter==='sold'?'active':'') + '" data-filter="sold">Sold</button>';
-    html +=       '<button class="chip ' + (live.poolFilter==='unsold'?'active':'') + '" data-filter="unsold">Unsold</button>';
-    html +=     '</div>';
-    html +=   '</div>';
-    html +=   '<div class="pool-scroll"><table class="roster-table"><thead><tr><th>Player</th><th>Role</th><th>Status</th><th>Team</th><th class="row-actions">Price (Cr)</th></tr></thead><tbody>';
-    if(filtered.length === 0){
-      html += '<tr class="empty-roster-row"><td colspan="5">No matching players.</td></tr>';
-    } else {
-      filtered.forEach(function(p){
-        var statusCls = norm(p.status) === 'sold' ? 'sold' : 'unsold';
-        html += '<tr>';
-        html +=   '<td class="player-name">' + esc(p.name) + '</td>';
-        html +=   '<td class="role-cell">' + esc(p.role || '—') + '</td>';
-        html +=   '<td><span class="badge ' + statusCls + '">' + esc(p.status || '—') + '</span></td>';
-        html +=   '<td class="role-cell">' + esc(p.team || '—') + '</td>';
-        html +=   '<td class="row-actions price-cell">' + (p.priceCr !== null ? '₹' + fmtCr(p.priceCr) : '—') + '</td>';
-        html += '</tr>';
-      });
-    }
-    html +=   '</tbody></table></div>';
-    html += '</div>';
 
     mainEl.innerHTML = html;
     bindLiveHandlers();
@@ -822,6 +863,11 @@
         renderLive();
       };
     });
+    mainEl.querySelectorAll('[data-view]').forEach(function(btn){
+      btn.onclick = function(){ live.view = btn.getAttribute('data-view'); renderLive(); };
+    });
+    var refreshBtnMain = document.getElementById('liveRefreshBtnMain');
+    if(refreshBtnMain){ refreshBtnMain.onclick = function(){ fetchTournament(live.tournament, true); }; }
     var teamSel = document.getElementById('liveTeamSelect');
     if(teamSel){ teamSel.onchange = function(){ live.team = teamSel.value; renderLive(); }; }
     var poolSearchInput = document.getElementById('poolSearchInput');
